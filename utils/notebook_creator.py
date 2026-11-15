@@ -919,7 +919,7 @@ oof_probs = np.zeros((len(df_meta), len(CLASS_NAMES)), dtype=float)
 learned_attentions = {}
 
 for fold, (train_idx, val_idx) in enumerate(skf.split(tool_ids_list, labels_arr)):
-    model = RotationalGatedAttentionMIL(in_dim=384, hid_dim=128, aux_dim=3, num_classes=len(CLASS_NAMES)).to(device)
+    model = RotationalGatedAttentionMIL(in_dim=bags_list[0][0].shape[-1], hid_dim=128, aux_dim=3, num_classes=len(CLASS_NAMES)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
     
     # Class-balanced weights
