@@ -180,38 +180,45 @@ df_meta.head()
 """))
 
 # ==============================================================================
-# CELL 3: [MANUAL FIX #1] RGB-TO-MASK TILT ALIGNMENT & ROI CROPPING HELPER
+# CELL 3: RGB-TO-MASK TILT ALIGNMENT & ROI CROPPING HELPER
 # ==============================================================================
 cells.append(make_md_cell("""
-## Cell 3: `🔧 [MANUAL FIX #1]` Aligning Raw Untilt-Corrected RGB Frames to Tilted Binary Masks
-Because the raw `.tiff` images in `images/toolXXX.zip` are unaligned while `masks_tilted/toolXXX/*.png` are already tilt-corrected, the helper below reads `applied_per_tool_rotations.json`, applies the exact same rotation to the raw RGB image, and overlays the binary mask contour so you can visually verify that they match pixel-for-pixel.
+## Cell 3: Aligning Raw RGB Frames to Tilt-Corrected Binary Masks & Master-Mask ROI Cropping
+The raw `.tiff` frames in `images/toolXXX.zip` have the physical axis tilt (`tilt_deg`), whereas `masks_tilted/toolXXX/*.png` have already been vertically aligned by applying `rotation_deg` (`= -tilt_deg`) from `applied_per_tool_rotations.json` using OpenCV's counter-clockwise-positive convention (`cv2.getRotationMatrix2D`, without negating the angle).
+
+The helpers below:
+1. Read `rotation_deg` directly from `applied_per_tool_rotations.json` (falling back to `-tilt_deg` if needed).
+2. Rotate each raw RGB frame around the image center via `cv2.getRotationMatrix2D` so it aligns pixel-for-pixel with `masks_tilted`.
+3. Build a per-tool **master mask** (bitwise union across all $360^\\circ$ masks) to locate the tool's absolute spatial envelope and maximum pixel width (with the cutting tip pointing downward), and crop a fixed active tool-head ROI across frames.
 """))
 
 cells.append(make_code_cell("""
-# 🔧 [MANUAL FIX #1A]: Check which key inside applied_per_tool_rotations.json holds the total applied angle.
-# Depending on how you saved the JSON, it might be 'rotation_deg', 'tilt_deg', or their sum.
 def get_tool_tilt_angle(tool_id, rotations_dict):
+    \"\"\"
+    Returns the OpenCV rotation angle (degrees, CCW-positive) needed to align
+    a raw RGB frame to its tilt-corrected mask in `masks_tilted`.
+    In `applied_per_tool_rotations.json`, `tilt_deg` is the measured raw axis tilt
+    and `rotation_deg` (= -tilt_deg) is the correction rotation already applied to the masks.
+    \"\"\"
     entry = rotations_dict.get(tool_id, {})
     if isinstance(entry, (int, float)):
         return float(entry)
-    # 🔧 [MANUAL FIX]: Adjust this formula if you applied only 'tilt_deg' or 'rotation_deg + tilt_deg'
-    rot_deg = float(entry.get("rotation_deg", 0.0) or 0.0)
-    tilt_deg = float(entry.get("tilt_deg", 0.0) or 0.0)
-    # Often 'rotation_deg' is the 0/90/180 coarse orientation and 'tilt_deg' is the fine vertical alignment:
-    total_angle = rot_deg + tilt_deg if rot_deg != 0 and abs(rot_deg) < 45 else (tilt_deg if tilt_deg != 0 else rot_deg)
-    return total_angle
+    if entry.get("rotation_deg") is not None:
+        return float(entry["rotation_deg"])
+    if entry.get("tilt_deg") is not None:
+        return -float(entry["tilt_deg"])
+    return 0.0
 
-# 🔧 [MANUAL FIX #1B]: Verify rotation direction (+angle vs -angle) and border padding
 def rotate_image_to_match_mask(img, angle_deg, is_mask=False):
     \"\"\"
-    Rotates an unaligned raw RGB image (or reverses a tilted mask) around the image center.
-    Note: In OpenCV, positive angle = counter-clockwise. If your mask generation script used
-    PIL.Image.rotate(angle) or scipy.ndimage.rotate(angle), check whether SIGN should be +1 or -1!
+    Rotates an image around its center using OpenCV's native convention
+    (positive angle = counter-clockwise, no sign negation).
+    Pass `angle_deg = rotation_deg` to align raw RGB -> `masks_tilted`,
+    or `angle_deg = -rotation_deg` (`+tilt_deg`) to revert a mask -> raw RGB.
     \"\"\"
-    SIGN = 1.0  # 🔧 [MANUAL FIX]: Change to -1.0 if the green contour in the test plot below is tilted the opposite way!
     H, W = img.shape[:2]
     center = (W / 2.0, H / 2.0)
-    M = cv2.getRotationMatrix2D(center, SIGN * angle_deg, 1.0)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
     interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
     border_val = 0 if is_mask else (128, 128, 128)
     return cv2.warpAffine(img, M, (W, H), flags=interp, borderMode=cv2.BORDER_CONSTANT, borderValue=border_val)
@@ -238,29 +245,41 @@ def download_and_extract_single_tool_rgb(tool_id, cache_dir=LOCAL_CACHE):
         Path(zip_path).unlink()
     return out_dir
 
-def crop_tool_head_roi(aligned_rgb, tilted_mask, pad_px=80, aspect_square=True):
+def build_tool_master_mask(tool_id, masks_dir=MASKS_DIR):
     \"\"\"
-    Uses the tilted binary mask to locate the cutting tool head and crops a clean bounding box.
-    🔧 [MANUAL FIX #1C]: Check whether the tool tip points DOWN (ymax) or UP (ymin) in your images.
-    From your teaser figure, the cutting tip points DOWNWARD toward the bottom of the frame!
+    Builds a per-tool master binary mask by taking the bitwise union (pixel sum > 0)
+    across all 360° tilt-corrected masks in `masks_tilted/toolXXX/`.
+    This captures the absolute spatial envelope and true maximum width of the tool.
     \"\"\"
-    ys, xs = np.where(tilted_mask > 127)
+    mask_paths = sorted((masks_dir / tool_id).glob("*.png"))
+    master = None
+    for p in mask_paths:
+        m = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        fg = m > 127
+        master = fg.copy() if master is None else (master | fg)
+    if master is None:
+        raise FileNotFoundError(f"No valid mask PNGs found for {tool_id} in {masks_dir / tool_id}")
+    return master.astype(np.uint8) * 255
+
+def get_tool_roi_box(master_mask, pad_px=80, aspect_square=True):
+    \"\"\"
+    Computes the fixed active tool-head bounding box `(xmin, xmax, ymin_roi, ymax_roi, tool_px_width)`
+    from the tool's master mask, with the cutting tip pointing downward (`ymax`).
+    \"\"\"
+    ys, xs = np.where(master_mask > 127)
     if len(xs) == 0:
-        return aligned_rgb, tilted_mask, 0
-    H, W = tilted_mask.shape[:2]
-    xmin, xmax = max(0, xs.min() - pad_px), min(W, xs.max() + pad_px)
-    ymin, ymax = max(0, ys.min() - pad_px), min(H, ys.max() + pad_px)
+        return None
+    H, W = master_mask.shape[:2]
+    xmin, xmax = max(0, int(xs.min()) - pad_px), min(W, int(xs.max()) + pad_px)
+    ymax = min(H, int(ys.max()) + pad_px)
     tool_px_width = int(xs.max() - xs.min())
 
-    # Focus on the cutting tip region (height = 1.35 * tool width from the tip)
-    TIP_POINTS_DOWN = True  # 🔧 [MANUAL FIX]: Set False if tip is at the top (ymin)
+    # Cutting tip points downward: anchor the ROI at the bottom (ymax) with height = 1.35 * tool width
     crop_h = int(max(tool_px_width * 1.35, xmax - xmin))
-    if TIP_POINTS_DOWN:
-        ymin_roi = max(0, ymax - crop_h)
-        ymax_roi = ymax
-    else:
-        ymin_roi = ymin
-        ymax_roi = min(H, ymin + crop_h)
+    ymin_roi = max(0, ymax - crop_h)
+    ymax_roi = ymax
 
     if aspect_square:
         cx = (xmin + xmax) // 2
@@ -271,6 +290,20 @@ def crop_tool_head_roi(aligned_rgb, tilted_mask, pad_px=80, aspect_square=True):
         ymin_roi = max(0, cy - half_side)
         ymax_roi = min(H, cy + half_side)
 
+    return (xmin, xmax, ymin_roi, ymax_roi, tool_px_width)
+
+def crop_tool_head_roi(aligned_rgb, tilted_mask, pad_px=80, aspect_square=True, master_mask=None, roi_box=None):
+    \"\"\"
+    Crops the active cutting tool head from `aligned_rgb` and `tilted_mask`.
+    Prefers a precomputed `roi_box` (or `master_mask`) so every frame of a tool
+    uses the exact same spatial bounding box and full-rotation `tool_px_width`.
+    \"\"\"
+    if roi_box is None:
+        ref_mask = master_mask if master_mask is not None else tilted_mask
+        roi_box = get_tool_roi_box(ref_mask, pad_px=pad_px, aspect_square=aspect_square)
+    if roi_box is None:
+        return aligned_rgb, tilted_mask, 0
+    xmin, xmax, ymin_roi, ymax_roi, tool_px_width = roi_box
     return aligned_rgb[ymin_roi:ymax_roi, xmin:xmax], tilted_mask[ymin_roi:ymax_roi, xmin:xmax], tool_px_width
 
 # --- VISUAL SANITY CHECK ON 1 TOOL ---
@@ -283,6 +316,8 @@ raw_rgb = tifffile.imread(sample_tiff)
 tilted_mask = cv2.imread(str(sample_png), cv2.IMREAD_GRAYSCALE)
 angle = get_tool_tilt_angle(TEST_TOOL, ROTATIONS_DICT)
 aligned_rgb = rotate_image_to_match_mask(raw_rgb, angle, is_mask=False)
+master_mask = build_tool_master_mask(TEST_TOOL)
+roi_box = get_tool_roi_box(master_mask, pad_px=80, aspect_square=True)
 
 fig, axes = plt.subplots(1, 3, figsize=(10, 3.5))
 axes[0].imshow(raw_rgb)
@@ -293,10 +328,10 @@ axes[1].imshow(aligned_rgb)
 axes[1].contour(tilted_mask, levels=[127], colors='lime', linewidths=1.0)
 axes[1].set_title(f"Tilt-Aligned RGB (angle={angle:.2f}°)\\n+ Tilted Mask Contour")
 
-crop_rgb, crop_msk, px_w = crop_tool_head_roi(aligned_rgb, tilted_mask)
+crop_rgb, crop_msk, px_w = crop_tool_head_roi(aligned_rgb, tilted_mask, roi_box=roi_box)
 axes[2].imshow(crop_rgb)
 axes[2].contour(crop_msk, levels=[127], colors='cyan', linewidths=1.0)
-axes[2].set_title(f"Cropped Active Tool Head ROI\\n(measured width={px_w} px)")
+axes[2].set_title(f"Cropped Active Tool Head ROI\\n(master-mask width={px_w} px)")
 for ax in axes: ax.axis('off')
 plt.tight_layout()
 plt.show()
@@ -307,53 +342,52 @@ plt.show()
 # ==============================================================================
 cells.append(make_md_cell("""
 ## Cell 4: Paper Figure 2 — Angle-Dependent Defect Visibility (`Fig2_Angle_Visibility.pdf`)
-Generates the figure you requested showing why full $360^\circ$ rotation is essential:
-* **a:** Fracture/deposit directly in front of the camera (visible on RGB surface, hidden in silhouette)
-* **b:** Fracture rotated to the rear hemisphere (completely occluded)
-* **c:** Fracture on the lateral tangent boundary (causes a clear drop/spike in the 2D binary silhouette area)
-* **d:** Full $360^\circ$ 1D projected silhouette area curve with vertical markers at $\\theta_a, \\theta_b, \\theta_c$.
+Demonstrates on `tool054` why full $360^\\circ$ rotation is essential for tool condition monitoring:
+* **a ($\\theta \\approx 93.96^\\circ$):** Fracture directly facing the camera (visible on RGB surface, hidden in silhouette)
+* **b ($\\theta \\approx 231.43^\\circ$):** Fracture rotated to the rear hemisphere (occluded behind the tool)
+* **c ($\\theta \\approx 172.09^\\circ$):** Fracture on the left lateral tangent boundary (clearly visible in the 2D binary silhouette)
+* **d:** Full $360^\\circ$ 1D projected silhouette area curve across the active tool-head ROI with vertical markers at $\\theta_a, \\theta_b, \\theta_c$.
 """))
 
 cells.append(make_code_cell("""
-# 🔧 [MANUAL FIX #2]: Choose which tool and which 3 frame indices (0..363) best show:
-#   idx_front: defect facing camera directly
-#   idx_back:  defect hidden on the back side (~180 deg away from idx_front)
-#   idx_edge:  defect on the left/right edge (where the silhouette area curve drops/spikes!)
-FIG2_TOOL_ID = "tool006"  # Try 'tool006' (corner fracture) or 'tool023' (BUE deposit)
+FIG2_TOOL_ID = "tool054"
+FRONT_DEG = 93.96   # Fracture facing camera directly
+BACK_DEG  = 231.43  # Fracture occluded on the rear side
+EDGE_DEG  = 172.09  # Fracture on the left peripheral edge
 
 raw_dir = download_and_extract_single_tool_rgb(FIG2_TOOL_ID)
 mask_files = sorted((MASKS_DIR / FIG2_TOOL_ID).glob("*.png"))
-tiff_files = sorted(raw_dir.glob("*.tiff"))
 tool_row = df_meta[df_meta["tool_id"] == FIG2_TOOL_ID].iloc[0]
 diam_mm = float(tool_row["diameter_mm"])
 angle_cal = get_tool_tilt_angle(FIG2_TOOL_ID, ROTATIONS_DICT)
 
-# Compute 1D projected silhouette area (white pixel count in active cutting zone) across all frames
+# Compute fixed active tool-head ROI once from the tool's master mask
+master_mask = build_tool_master_mask(FIG2_TOOL_ID)
+roi_box = get_tool_roi_box(master_mask, pad_px=60, aspect_square=True)
+xmin, xmax, ymin_roi, ymax_roi, px_w = roi_box
+
+# Compute 1D projected silhouette area inside the active tool-head ROI across all frames
 areas = []
 angles_deg = []
 for m_path in mask_files:
     deg_str = m_path.stem.split("_")[0]
     angles_deg.append(float(deg_str))
     m_img = cv2.imread(str(m_path), cv2.IMREAD_GRAYSCALE)
-    # Count foreground pixels in the bottom active cutting region so shank variations don't dominate
-    H = m_img.shape[0]
-    areas.append(np.sum(m_img[int(H*0.35):, :] > 127))
+    areas.append(np.sum(m_img[ymin_roi:ymax_roi, xmin:xmax] > 127))
 
 areas = np.array(areas, dtype=float)
-areas_norm_pct = (areas / np.median(areas)) * 100.0  # Normalized % of median intact profile area
+areas_norm_pct = (areas / np.median(areas)) * 100.0  # Normalized % of median profile area
 angles_deg = np.array(angles_deg)
 
-# Auto-pick default indices based on minimum silhouette area (edge fracture), +90 deg (front), -90 deg (back)
-# 🔧 [MANUAL FIX #2B]: Override idx_front, idx_back, idx_edge with your favorite exact frame numbers!
-idx_edge = int(np.argmin(areas_norm_pct))
-N_frames = len(mask_files)
-idx_front = (idx_edge + N_frames // 4) % N_frames
-idx_back = (idx_front + N_frames // 2) % N_frames
+# Select exact frames closest to the verified viewing angles
+idx_front = int(np.argmin(np.abs(angles_deg - FRONT_DEG)))
+idx_back  = int(np.argmin(np.abs(angles_deg - BACK_DEG)))
+idx_edge  = int(np.argmin(np.abs(angles_deg - EDGE_DEG)))
 
 selected_indices = [
     ("a", idx_front, "Front-facing defect\\n(visible on surface, intact silhouette)", "#1f77b4"),
     ("b", idx_back,  "Rear-occluded defect\\n(hidden behind tool core)", "#7f7f7f"),
-    ("c", idx_edge,  "Peripheral edge defect\\n(alters 2D silhouette area)", "#d62728"),
+    ("c", idx_edge,  "Left-edge defect\\n(alters 2D silhouette profile)", "#d62728"),
 ]
 
 fig = plt.figure(figsize=(7.2, 4.8))
@@ -361,16 +395,20 @@ gs = gridspec.GridSpec(2, 3, height_ratios=[1.35, 1.0], hspace=0.35, wspace=0.18
 
 for col_i, (p_label, f_idx, title_txt, col_hex) in enumerate(selected_indices):
     ax = fig.add_subplot(gs[0, col_i])
-    rgb = tifffile.imread(tiff_files[f_idx])
-    msk = cv2.imread(str(mask_files[f_idx]), cv2.IMREAD_GRAYSCALE)
+    m_path = mask_files[f_idx]
+    t_path = raw_dir / (m_path.stem + ".tiff")
+    if not t_path.exists():
+        t_path = sorted(raw_dir.glob("*.tiff"))[f_idx]
+
+    rgb = tifffile.imread(t_path)
+    msk = cv2.imread(str(m_path), cv2.IMREAD_GRAYSCALE)
     rgb_aligned = rotate_image_to_match_mask(rgb, angle_cal, is_mask=False)
-    crop_rgb, crop_msk, px_w = crop_tool_head_roi(rgb_aligned, msk, pad_px=60)
+    crop_rgb, crop_msk, px_w = crop_tool_head_roi(rgb_aligned, msk, roi_box=roi_box)
 
     ax.imshow(crop_rgb, rasterized=True)
-    # Overlay binary silhouette boundary in dashed color
     ax.contour(crop_msk, levels=[127], colors=[col_hex], linewidths=1.2)
     deg_val = angles_deg[f_idx]
-    ax.set_title(f"$\\\\theta = {deg_val:.1f}^\\\\circ$ (Frame {f_idx})\\n{title_txt}", fontsize=8, color=col_hex, fontweight='bold')
+    ax.set_title(f"$\\\\theta = {deg_val:.2f}^\\\\circ$ (Frame {f_idx})\\n{title_txt}", fontsize=8, color=col_hex, fontweight='bold')
     ax.axis('off')
     add_panel_label(ax, p_label, x=-0.04, y=1.12)
     if col_i == 0:
@@ -384,7 +422,7 @@ for p_label, f_idx, title_txt, col_hex in selected_indices:
     val_pct = areas_norm_pct[f_idx]
     ax_sig.axvline(deg_val, color=col_hex, linestyle='--', linewidth=1.2, alpha=0.85)
     ax_sig.scatter([deg_val], [val_pct], color=col_hex, s=38, zorder=5,
-                   label=f"Panel {p_label} ($\\\\theta={deg_val:.1f}^\\\\circ$: {val_pct:.1f}%)")
+                   label=f"Panel {p_label} ($\\\\theta={deg_val:.2f}^\\\\circ$: {val_pct:.1f}%)")
 
 ax_sig.set_xlim(0, 360)
 ax_sig.set_xlabel("Rotational angle $\\\\theta$ (degrees)")
@@ -636,66 +674,112 @@ Answers your question: **"If I extract the feature map, do I only need to save t
 cells.append(make_code_cell("""
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
 import timm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# Load frozen DINOv2-Small backbone (384-dim embeddings, awesome for metallic surface & edge defects)
-backbone = timm.create_model("vit_small_patch14_dinov2.lvd142m", pretrained=True, num_classes=0, dynamic_img_size=True)
-backbone = backbone.to(device).eval()
+# 🔧 [STAGE 2 BACKBONE CHOICE]:
+#   "dinov2_small" : vit_small_patch14_dinov2.lvd142m (384-dim, fast, strong zero-shot surface/edge features)
+#   "dinov2_base"  : vit_base_patch14_dinov2.lvd142m  (768-dim, heavier for A100/L4 GPUs)
+#   "convnext_small": convnext_small.fb_in22k         (768-dim, 7x7 depthwise convs great for repetitive flutes)
+#   "wideresnet50_multiscale": wide_resnet50_2        (1536-dim Layer2+Layer3 PatchCore-style industrial features)
+BACKBONE_CHOICE = "dinov2_small"
 
+class IndustrialFeatureExtractor(nn.Module):
+    def __init__(self, choice="dinov2_small"):
+        super().__init__()
+        self.choice = choice
+        if choice == "dinov2_small":
+            self.net = timm.create_model("vit_small_patch14_dinov2.lvd142m", pretrained=True, num_classes=0, dynamic_img_size=True)
+            self.out_dim = 384 * 2  # Concatenates global [CLS] token + max of spatial patch tokens!
+        elif choice == "dinov2_base":
+            self.net = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, num_classes=0, dynamic_img_size=True)
+            self.out_dim = 768 * 2
+        elif choice == "convnext_small":
+            self.net = timm.create_model("convnext_small.fb_in22k", pretrained=True, num_classes=0)
+            self.out_dim = 768
+        elif choice == "wideresnet50_multiscale":
+            # Extracts intermediate Layer 2 (512-d) + Layer 3 (1024-d) features like PatchCore (CVPR 2022)
+            self.net = timm.create_model("wide_resnet50_2", pretrained=True, features_only=True, out_indices=(2, 3))
+            self.out_dim = 512 + 1024
+
+    def forward(self, x):
+        if "dinov2" in self.choice:
+            # forward_features returns [B, N_patches + 1, D]
+            tokens = self.net.forward_features(x)
+            cls_token = tokens[:, 0]                  # Global tool appearance [B, D]
+            patch_max = tokens[:, 1:].amax(dim=1)     # Strongest local patch response (catches tiny fractures!) [B, D]
+            return torch.cat([cls_token, patch_max], dim=-1)
+        elif self.choice == "wideresnet50_multiscale":
+            f2, f3 = self.net(x)                      # Mid-level edge/texture maps
+            # Global average + spatial max pooling on Layer 2 and Layer 3
+            v2 = 0.5 * (F.adaptive_avg_pool2d(f2, 1).flatten(1) + F.adaptive_max_pool2d(f2, 1).flatten(1))
+            v3 = 0.5 * (F.adaptive_avg_pool2d(f3, 1).flatten(1) + F.adaptive_max_pool2d(f3, 1).flatten(1))
+            return torch.cat([v2, v3], dim=-1)
+        else:
+            return self.net(x)
+
+backbone = IndustrialFeatureExtractor(BACKBONE_CHOICE).to(device).eval()
+FEAT_DIM = backbone.out_dim
+print(f"Loaded {BACKBONE_CHOICE} | Output feature dimension per frame: {FEAT_DIM}")
+
+IMG_SIZE = 336 if "dinov2" in BACKBONE_CHOICE else 256
 img_transform = transforms.Compose([
     transforms.ToPILImage(),
-    transforms.Resize((224, 224)),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# 🔧 [MANUAL FIX #5]:
-# Set USE_RAW_RGB_DOWNLOAD = False first to test the whole MIL pipeline in ~3 minutes using only the binary masks!
-# When ready to extract from the full 419 GB raw RGB TIFFs, set USE_RAW_RGB_DOWNLOAD = True.
-# Because each tool is saved to Google Drive as toolXXX.pt, you can stop and resume anytime!
+# Set False for a 3-minute test on masks, or True to stream the raw RGB TIFFs
 USE_RAW_RGB_DOWNLOAD = False
 BATCH_SIZE = 64
 
 @torch.no_grad()
 def extract_features_for_tool(tool_id, use_raw_rgb=False):
-    save_path = FEAT_DIR / f"{tool_id}_{'rgb' if use_raw_rgb else 'mask'}.pt"
+    mode_tag = f"{BACKBONE_CHOICE}_{'rgb' if use_raw_rgb else 'mask'}"
+    save_path = FEAT_DIR / f"{tool_id}_{mode_tag}.pt"
     if save_path.exists():
         return torch.load(save_path, map_location="cpu")
 
     mask_files = sorted((MASKS_DIR / tool_id).glob("*.png"))
     angle_cal = get_tool_tilt_angle(tool_id, ROTATIONS_DICT)
 
+    # STAGE 1: Compute Master Mask & Fixed ROI Box ONCE per tool!
+    master_mask = build_tool_master_mask(tool_id)
+    roi_box = get_tool_roi_box(master_mask, pad_px=40, aspect_square=True)
+    xmin, xmax, ymin_roi, ymax_roi, _ = roi_box
+
     if use_raw_rgb:
         raw_dir = download_and_extract_single_tool_rgb(tool_id)
         tiff_files = sorted(raw_dir.glob("*.tiff"))
     else:
-        tiff_files = mask_files  # Fast fallback using binary masks replicated to 3 channels
+        tiff_files = mask_files
 
-    batch_tensors = []
-    feats_list = []
-    angles_list = []
-    areas_list = []
+    batch_tensors, feats_list, angles_list, areas_list = [], [], [], []
 
     for f_idx, m_path in enumerate(mask_files):
         deg_val = float(m_path.stem.split("_")[0])
         angles_list.append(deg_val)
 
         msk = cv2.imread(str(m_path), cv2.IMREAD_GRAYSCALE)
-        H = msk.shape[0]
-        areas_list.append(float(np.sum(msk[int(H*0.35):, :] > 127)))
+        # Compute 1D silhouette pixel area strictly inside the fixed Master-Mask ROI
+        areas_list.append(float(np.sum(msk[ymin_roi:ymax_roi, xmin:xmax] > 127)))
 
         if use_raw_rgb and f_idx < len(tiff_files):
-            rgb = tifffile.imread(tiff_files[f_idx])
+            t_path = raw_dir / (m_path.stem + ".tiff")
+            if not t_path.exists():
+                t_path = tiff_files[f_idx]
+            rgb = tifffile.imread(t_path)
             rgb_aligned = rotate_image_to_match_mask(rgb, angle_cal, is_mask=False)
-            crop_img, crop_msk, _ = crop_tool_head_roi(rgb_aligned, msk, pad_px=40)
-            # Optional: mask out background noise so network focuses purely on tool surface + silhouette edge
+            crop_img, crop_msk, _ = crop_tool_head_roi(rgb_aligned, msk, roi_box=roi_box)
+            # Zero out background so network focuses strictly on tool surface & silhouette edge
             crop_img = cv2.bitwise_and(crop_img, crop_img, mask=(crop_msk > 127).astype(np.uint8) * 255)
         else:
-             _, crop_msk, _ = crop_tool_head_roi(msk, msk, pad_px=40)
+            _, crop_msk, _ = crop_tool_head_roi(msk, msk, roi_box=roi_box)
             crop_img = cv2.cvtColor(crop_msk, cv2.COLOR_GRAY2RGB)
 
         batch_tensors.append(img_transform(crop_img))
@@ -706,25 +790,23 @@ def extract_features_for_tool(tool_id, use_raw_rgb=False):
             feats_list.append(emb)
             batch_tensors = []
 
-    # Clean up raw RGB folder after extracting to keep Colab disk free!
     if use_raw_rgb:
         shutil.rmtree(LOCAL_CACHE / "raw_rgb" / tool_id, ignore_errors=True)
 
     data_dict = {
         "tool_id": tool_id,
-        "features": torch.cat(feats_list, dim=0).to(torch.float16),  # [K, 384] in fp16 (~300 KB!)
-        "angles": torch.tensor(angles_list, dtype=torch.float32),    # [K]
-        "areas": torch.tensor(areas_list, dtype=torch.float32),      # [K]
+        "features": torch.cat(feats_list, dim=0).to(torch.float16),
+        "angles": torch.tensor(angles_list, dtype=torch.float32),
+        "areas": torch.tensor(areas_list, dtype=torch.float32),
     }
     torch.save(data_dict, save_path)
     return data_dict
 
-# Extract features for all 115 tools (skips any already saved in Google Drive)
 all_tool_data = {}
-for t_id in tqdm(df_meta["tool_id"], desc="Extracting rotational features"):
+for t_id in tqdm(df_meta["tool_id"], desc=f"Extracting ({BACKBONE_CHOICE})"):
     all_tool_data[t_id] = extract_features_for_tool(t_id, use_raw_rgb=USE_RAW_RGB_DOWNLOAD)
 
-print(f"Done! All 115 tool feature bags cached in {FEAT_DIR}")
+print(f"Done! Cached 115 tool feature bags in {FEAT_DIR}")
 """))
 
 # ==============================================================================
